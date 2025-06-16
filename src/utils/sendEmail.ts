@@ -1,23 +1,28 @@
 import nodemailer from 'nodemailer';
+import dotenv from 'dotenv';
+dotenv.config();
 
-export const sendEmail = async (to: string, subject: string, text: string) => {
-  // Create a transporter with email service config
+export const sendOTP = async (email: string, otp: string) => {
   const transporter = nodemailer.createTransport({
-    service: 'gmail', // usr can use gmail or any other email provider
+    service: 'gmail',
     auth: {
-      user: process.env.EMAIL_USER, //  email address
-      pass: process.env.EMAIL_PASS, //  email password or app password
+      user: process.env.MAIL_USER,
+      pass: process.env.MAIL_PASS,
     },
   });
 
-  // Email options
   const mailOptions = {
-    from: process.env.EMAIL_USER,
-    to,
-    subject,
-    text,
+    from: process.env.MAIL_USER,
+    to: email,
+    subject: 'Your OTP Code',
+    text: `Your OTP code is ${otp}. It is valid for 10 minutes.`,
   };
 
-  // Send email
-  await transporter.sendMail(mailOptions);
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    console.log("✅ Email sent:", info.messageId);
+  } catch (err) {
+    console.error("❌ Failed to send email:", err);
+    throw new Error("Failed to send OTP email");
+  }
 };

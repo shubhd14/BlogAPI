@@ -1,18 +1,25 @@
 import { Request, Response } from "express";
-import bcrypt from 'bcryptjs';
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 import User from "../models/user.model";
 import { generateOtp } from "../utils/generateOtp";
-import jwt from "jsonwebtoken";
+import { generateTokens } from "../utils/jwt";
+import { sendOTP } from "../utils/sendEmail"; // nodemailer 
 
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret";
 const JWT_EXPIRES_IN = "1h";
 
-//  Jwt token generator
-const generateToken = (userId: string, role: string) => {
-  return jwt.sign({ userId, role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+// In-memory store for OTP and signup data
+type TempUserData = {
+  phone: string;
+  password: string;
+  otp: string;
+  otpExpiry: Date;
+  role: string;
 };
+const tempSignupStore = new Map<string, TempUserData>();
 
-// SIGNUP
+// SIGNUP - Send OTP Only (no DB write yet)
 export const signup = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, phone, password, role = "user" } = req.body;
@@ -25,70 +32,80 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
     }
 
     const otp = generateOtp();
-    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
 
-    const user = new User({
-      email: lowerEmail,
+    try {
+      await sendOTP(lowerEmail, otp);
+    } catch (emailError) {
+      console.error("Failed to send OTP email:", emailError);
+      res.status(500).json({ message: "Failed to send OTP email. Please try again." });
+      return;
+    }
+
+    tempSignupStore.set(lowerEmail, {
       phone,
-      password,
+      password: hashedPassword,
       otp,
       otpExpiry,
-      isVerified: false,
       role,
     });
 
-    await user.save();
-    console.log(`OTP for ${lowerEmail}: ${otp}`);
-    res.status(201).json({ message: "User registered, OTP sent" });
+    res.status(200).json({ message: "OTP sent to email. Please verify to complete registration." });
   } catch (error) {
     console.error("Signup Error:", error);
     res.status(500).json({ message: "Internal server error" });
   }
 };
 
-// VERIFY OTP
+// VERIFY OTP and register user
 export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, otp } = req.body;
     const lowerEmail = email.toLowerCase();
 
-    const user = await User.findOne({ email: lowerEmail });
-
-    if (!user) {
-      res.status(404).json({ message: "User not found" });
+    const tempData = tempSignupStore.get(lowerEmail);
+    if (!tempData) {
+      res.status(400).json({ message: "OTP expired or not requested" });
       return;
     }
 
-    if (user.otp !== otp) {
+    if (tempData.otp !== otp) {
       res.status(400).json({ message: "Invalid OTP" });
       return;
     }
 
-    if (!user.otpExpiry || user.otpExpiry < new Date()) {
+    if (tempData.otpExpiry < new Date()) {
+      tempSignupStore.delete(lowerEmail);
       res.status(400).json({ message: "OTP expired" });
       return;
     }
 
-    user.isVerified = true;
-    user.otp = undefined;
-    user.otpExpiry = undefined;
-    await user.save();
+    const user = new User({
+      email: lowerEmail,
+      phone: tempData.phone,
+      password: tempData.password,
+      isVerified: true,
+      role: tempData.role,
+    });
 
-    res.status(200).json({ message: "OTP verified successfully" });
+    await user.save();
+    tempSignupStore.delete(lowerEmail);
+
+    res.status(201).json({ message: "User registered successfully" });
   } catch (error) {
     console.error("Verify OTP Error:", error);
     res.status(500).json({ message: "Internal server error" });
   }
 };
 
-// ✅ SIGNIN
+// SIGNIN
 export const signin = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body;
     const lowerEmail = email.toLowerCase();
 
     const user = await User.findOne({ email: lowerEmail });
-
     if (!user) {
       res.status(404).json({ message: "User not found" });
       return;
@@ -99,21 +116,32 @@ export const signin = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    if (user.password !== password) {
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
       res.status(401).json({ message: "Invalid password" });
       return;
     }
 
-    const token = generateToken((user._id as string), user.role);
+    const userId = String(user._id);
+    const userRole = user.role;
 
-    res.status(200).json({ message: "Login successful", token });
+    const { accessToken, refreshToken } = generateTokens(userId, userRole);
+
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    res.status(200).json({ message: "Login successful", accessToken });
   } catch (error) {
     console.error("Signin Error:", error);
     res.status(500).json({ message: "Internal server error" });
   }
 };
 
-// ✅ GET PROFILE
+// GET PROFILE
 export const getProfile = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.user) {
@@ -128,7 +156,7 @@ export const getProfile = async (req: Request, res: Response): Promise<void> => 
   }
 };
 
-// ✅ UPDATE PROFILE
+// UPDATE PROFILE
 export const updateProfile = async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.user) {
@@ -141,7 +169,7 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
 
     if (name) updateData.name = name;
     if (phone) updateData.phone = phone;
-    if (password) updateData.password = password;
+    if (password) updateData.password = await bcrypt.hash(password, 10);
 
     const updatedUser = await User.findByIdAndUpdate(req.user._id, updateData, { new: true });
 

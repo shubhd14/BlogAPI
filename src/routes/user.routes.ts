@@ -5,9 +5,6 @@ import catchAsync from "../utils/catchAsync";
 
 const router = express.Router();
 
-router.get("/profile", catchAsync(verifyToken), catchAsync(getProfile)); 
+router.get("/profile", verifyToken, catchAsync(getProfile)); 
 
 export default router;
-
-
-
